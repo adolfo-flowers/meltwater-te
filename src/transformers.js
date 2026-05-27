@@ -79,6 +79,7 @@ export async function preparePipelineStreams(
     throw new Error('Could not identify character encoding layout.');
 
   const native = getNativeNodeEncoding(detected);
+
   if (native) {
     return {
       encoding: detected,
@@ -94,25 +95,26 @@ export async function preparePipelineStreams(
 
   if (!iconv.encodingExists(detected))
     throw new Error(`Encoding "${detected}" is unrecognized.`);
+
+  const decoder = iconv.decodeStream(detected);
+  decoder._writableState.highWaterMark = chunkSize;
+  decoder._readableState.highWaterMark = chunkSize;
+
   return {
     encoding: detected,
     steps: [
       createReadStream(filepath, { highWaterMark: chunkSize }),
-      iconv.decodeStream(detected),
+      decoder,
       transformerStream,
     ],
   };
 }
 
-export function createRedactionTransformer({
-  keywords,
-  contextLen,
-  insertStmt,
-  filename,
-  originalMd5,
-  encryptEnabled,
-  masterKeyBuffer,
-}) {
+/**
+ * 1. PURE REDACTION TRANSFORMER
+ * Pure chunk processor. Emits structured data chunks downstream.
+ */
+export function createRedactionTransformer({ keywords, contextLen }) {
   const sortedKeywords = [...keywords].sort((a, b) => b.length - a.length);
   const escapedKeywords = sortedKeywords.map((k) =>
     k.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')
@@ -120,102 +122,196 @@ export function createRedactionTransformer({
   const masterRegex = new RegExp(`(${escapedKeywords.join('|')})`, 'gi');
 
   const maxKeywordLen = Math.max(...sortedKeywords.map((k) => k.length), 0);
-  const overlapWindowSize = (maxKeywordLen + contextLen) * 2;
+  const tailOverlapSize = maxKeywordLen + contextLen;
 
-  let textBuffer = '';
-  let globalCharOffset = 0;
+  let carryOverTail = '';
+  let originalCharOffset = 0;
+  let redactedCharOffset = 0;
 
   return new Transform({
     writableObjectMode: false,
-    readableObjectMode: false,
+    readableObjectMode: true, // Emits objects containing text & found matches
 
     transform(chunk, encoding, callback) {
-      textBuffer += chunk.toString();
-
+      const currentSegment = carryOverTail + chunk.toString();
       let match;
       let lastIndex = 0;
       let cleanedText = '';
+      const matchesFound = [];
 
       masterRegex.lastIndex = 0;
+      const safeScanBoundary = currentSegment.length - tailOverlapSize;
 
-      while ((match = masterRegex.exec(textBuffer)) !== null) {
+      while ((match = masterRegex.exec(currentSegment)) !== null) {
         const matchIndex = match.index;
-        const matchedWord = match[0];
-
-        cleanedText += textBuffer.substring(lastIndex, matchIndex);
-
-        const absoluteCharPosition = globalCharOffset + cleanedText.length;
-
-        const contextBefore = textBuffer.substring(
-          Math.max(0, matchIndex - contextLen),
-          matchIndex
-        );
-        const contextAfter = textBuffer.substring(
-          matchIndex + matchedWord.length,
-          matchIndex + matchedWord.length + contextLen
-        );
-
-        let dbName = filename;
-        let dbWord = matchedWord;
-        let dbBefore = contextBefore;
-        let dbAfter = contextAfter;
-        let encryptFlagValue = 0;
-
-        if (encryptEnabled) {
-          dbName = encryptText(filename, masterKeyBuffer);
-          dbWord = encryptText(matchedWord, masterKeyBuffer);
-          dbBefore = encryptText(contextBefore, masterKeyBuffer);
-          dbAfter = encryptText(contextAfter, masterKeyBuffer);
-          encryptFlagValue = 1;
+        if (matchIndex > safeScanBoundary && safeScanBoundary > 0) {
+          break;
         }
 
-        // Write row directly into sqlite file storage
-        insertStmt.run(
-          dbName,
-          originalMd5,
-          null, // updated downstream in index.js post pipeline completion pass
-          dbWord,
-          absoluteCharPosition,
-          dbBefore,
-          dbAfter,
-          encryptFlagValue
+        const matchedWord = match[0];
+        const precedingFragment = currentSegment.substring(
+          lastIndex,
+          matchIndex
         );
+        cleanedText += precedingFragment;
+
+        const absoluteOriginalPosition =
+          originalCharOffset + precedingFragment.length;
+        const absoluteRedactedPosition =
+          redactedCharOffset + cleanedText.length;
+
+        matchesFound.push({
+          matchedWord,
+          absoluteOriginalPosition,
+          absoluteRedactedPosition,
+          contextBefore: currentSegment.substring(
+            Math.max(0, matchIndex - contextLen),
+            matchIndex
+          ),
+          contextAfter: currentSegment.substring(
+            matchIndex + matchedWord.length,
+            matchIndex + matchedWord.length + contextLen
+          ),
+        });
 
         cleanedText += 'XXXX';
+        originalCharOffset += precedingFragment.length + matchedWord.length;
         lastIndex = masterRegex.lastIndex;
       }
 
-      cleanedText += textBuffer.substring(lastIndex);
-      const safePushLen = Math.max(0, cleanedText.length - overlapWindowSize);
+      const staticFragment = currentSegment.substring(lastIndex);
+      if (staticFragment.length > tailOverlapSize) {
+        const safePushLen = staticFragment.length - tailOverlapSize;
+        const pushText = staticFragment.substring(0, safePushLen);
+        cleanedText += pushText;
 
-      if (safePushLen > 0) {
-        this.push(cleanedText.substring(0, safePushLen));
-        globalCharOffset += safePushLen;
-        textBuffer = cleanedText.substring(safePushLen);
+        this.push({ text: cleanedText, matches: matchesFound });
+        originalCharOffset += pushText.length;
+        redactedCharOffset += cleanedText.length;
+        carryOverTail = staticFragment.substring(safePushLen);
       } else {
-        textBuffer = cleanedText;
+        this.push({ text: cleanedText, matches: matchesFound });
+        redactedCharOffset += cleanedText.length;
+        carryOverTail = staticFragment;
       }
       callback();
     },
 
     flush(callback) {
-      if (textBuffer) {
-        this.push(textBuffer);
+      if (carryOverTail) {
+        this.push({ text: carryOverTail, matches: [] });
       }
       callback();
     },
   });
 }
 
+/**
+ * 2. TRANSACTIONAL DATABASE BATCH WRITER
+ * Flushes row packets directly inside a safe, high-speed transaction block.
+ * Memory layout is capped to preserve memory headroom.
+ */
+export function createDatabaseBatchWriterTransformer({
+  db,
+  insertStmt,
+  filename,
+  originalMd5,
+  encryptEnabled,
+  masterKeyBuffer,
+  batchSize = 100000, // Safe memory barrier limit
+}) {
+  let recordBatch = [];
+
+  // Create a fast, synchronous transaction runner right inside the transformer setup
+  const runTransaction = db.transaction((rows) => {
+    for (const row of rows) {
+      insertStmt.run(row);
+    }
+  });
+
+  const flushBatch = () => {
+    if (recordBatch.length === 0) return;
+
+    const databaseRows = [];
+    for (const match of recordBatch) {
+      let dbName = filename;
+      let dbWord = match.matchedWord;
+      let dbBefore = match.contextBefore;
+      let dbAfter = match.contextAfter;
+      let encryptFlagValue = 0;
+
+      if (encryptEnabled) {
+        dbName = encryptText(filename, masterKeyBuffer);
+        dbWord = encryptText(match.matchedWord, masterKeyBuffer);
+        dbBefore = encryptText(match.contextBefore, masterKeyBuffer);
+        dbAfter = encryptText(match.contextAfter, masterKeyBuffer);
+        encryptFlagValue = 1;
+      }
+
+      databaseRows.push({
+        documentName: dbName,
+        originalMd5,
+        redactedWord: dbWord,
+        charPosition: match.absoluteOriginalPosition,
+        redactedPosition: match.absoluteRedactedPosition,
+        contextBefore: dbBefore,
+        contextAfter: dbAfter,
+        isEncrypted: encryptFlagValue,
+      });
+    }
+
+    recordBatch = []; // Free array references early to enable garbage collection execution passes
+    runTransaction(databaseRows);
+  };
+
+  return new Transform({
+    writableObjectMode: true,
+    readableObjectMode: true,
+
+    transform(chunk, encoding, callback) {
+      if (chunk.matches?.length > 0) {
+        recordBatch.push(...chunk.matches);
+        if (recordBatch.length >= batchSize) {
+          flushBatch();
+        }
+      }
+      this.push(chunk); // Pass object cleanly to next filter
+      callback();
+    },
+
+    flush(callback) {
+      flushBatch();
+      callback();
+    },
+  });
+}
+
+/**
+ * 3. TEXT OUTPUT EXTRACTION FILTER
+ */
+export function createTextExtractionTransformer() {
+  return new Transform({
+    writableObjectMode: true,
+    readableObjectMode: false,
+
+    transform(chunk, encoding, callback) {
+      if (chunk.text) {
+        this.push(chunk.text);
+      }
+      callback();
+    },
+  });
+}
+
+/**
+ * 4. UNREDACTION TRANSFORMER
+ */
 export function createUnredactionTransformer(unredactMap) {
   let mapTrackers = [...unredactMap].sort(
     (a, b) => a.redactedPosition - b.redactedPosition
   );
   let textBuffer = '';
   let globalCharOffset = 0;
-
-  let totalDelta = 0;
-
   const overlapWindowSize = 100;
 
   return new Transform({
@@ -227,23 +323,21 @@ export function createUnredactionTransformer(unredactMap) {
 
       while (mapTrackers.length > 0) {
         const nextTarget = mapTrackers[0];
+        const localIndex = nextTarget.redactedPosition - globalCharOffset;
 
-        const localIndex =
-          nextTarget.redactedPosition + totalDelta - globalCharOffset;
-
-        if (localIndex < 0 || localIndex + 4 > textBuffer.length) {
+        if (localIndex + 4 > textBuffer.length) {
           break;
         }
 
         mapTrackers.shift();
 
         if (textBuffer.substring(localIndex, localIndex + 4) === 'XXXX') {
-          const original = nextTarget.originalWord;
           textBuffer =
             textBuffer.substring(0, localIndex) +
-            original +
+            nextTarget.originalWord +
             textBuffer.substring(localIndex + 4);
-          totalDelta += original.length - 4;
+
+          globalCharOffset -= nextTarget.originalWord.length - 4;
         }
       }
 
@@ -260,21 +354,17 @@ export function createUnredactionTransformer(unredactMap) {
     flush(callback) {
       while (mapTrackers.length > 0) {
         const nextTarget = mapTrackers.shift();
-        const localIndex =
-          nextTarget.redactedPosition + totalDelta - globalCharOffset;
-
+        const localIndex = nextTarget.redactedPosition - globalCharOffset;
         if (localIndex >= 0 && localIndex + 4 <= textBuffer.length) {
           if (textBuffer.substring(localIndex, localIndex + 4) === 'XXXX') {
-            const original = nextTarget.originalWord;
             textBuffer =
               textBuffer.substring(0, localIndex) +
-              original +
+              nextTarget.originalWord +
               textBuffer.substring(localIndex + 4);
-            totalDelta += original.length - 4;
+            globalCharOffset -= nextTarget.originalWord.length - 4;
           }
         }
       }
-
       if (textBuffer) {
         this.push(textBuffer);
       }

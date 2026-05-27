@@ -16,10 +16,11 @@ import {
 // Import streaming operations from transformers.js
 import {
   parseKeywords,
-  decryptText,
   calculateFileMd5,
   preparePipelineStreams,
   createRedactionTransformer,
+  createDatabaseBatchWriterTransformer,
+  createTextExtractionTransformer,
   createUnredactionTransformer,
 } from './transformers.js';
 
@@ -56,12 +57,11 @@ program
 export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
   const contextLen = parseInt(opts.context, 10);
   const keywords = parseKeywords(opts.keywords);
-  const CHUNK_SIZE = 1000;
+  const CHUNK_SIZE = 64 * 1024; // 64KB chunks match hardware caches perfectly
 
-  // Prepared statements for high performance execution loops
   const insertStmt = db.prepare(`
-    INSERT INTO redactions (document_name, original_md5, redacted_md5, redacted_word, char_position, context_before, context_after, is_encrypted)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO redactions (document_name, original_md5, redacted_word, char_position, redacted_position, context_before, context_after, is_encrypted)
+    VALUES (@documentName, @originalMd5, @redactedWord, @charPosition, @redactedPosition, @contextBefore, @contextAfter, @isEncrypted)
   `);
 
   const updateHashStmt = db.prepare(`
@@ -71,19 +71,6 @@ export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
   console.log(
     pc.red(pc.bold(`\n🔒 INITIALIZING INLINE PIPELINE REDACTION PROCESS`))
   );
-  if (opts.encrypt) {
-    console.log(
-      pc.green(
-        `🛡  Database Encryption Active using Master Key file: ${pc.bold(opts.keyfile)}\n`
-      )
-    );
-  } else {
-    console.log(
-      pc.yellow(
-        `⚠️  Database Encryption Disabled (Storing metadata parameters as cleartext)\n`
-      )
-    );
-  }
 
   const pipelinePromises = filepaths.map(async (filepath) => {
     const filename = path.basename(filepath);
@@ -104,32 +91,39 @@ export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
       };
     }
 
-    // Instantiating the streamlined transformer with inline context references
-    const transformer = createRedactionTransformer({
+    // Set up our streaming components
+    const redactionTransformer = createRedactionTransformer({
       keywords,
       contextLen,
+    });
+    const textExtractionTransformer = createTextExtractionTransformer();
+
+    const batchWriterTransformer = createDatabaseBatchWriterTransformer({
       db,
       insertStmt,
       filename,
       originalMd5,
       encryptEnabled: !!opts.encrypt,
       masterKeyBuffer,
+      batchSize: 100000, // Flushes database inside transaction loops every 100,000 matches
     });
 
     try {
       const { encoding, steps } = await preparePipelineStreams(
         filepath,
-        transformer,
+        redactionTransformer,
         CHUNK_SIZE
       );
 
-      // Execute stream processing pipeline
-      await pipeline(...steps, createWriteStream(outputPath));
+      // Execute stream processing pipeline natively
+      await pipeline(
+        ...steps,
+        batchWriterTransformer,
+        textExtractionTransformer,
+        createWriteStream(outputPath)
+      );
 
-      // Calculate final target validation output signature
       const redactedMd5 = await calculateFileMd5(outputPath);
-
-      // Backfill signature tracking properties matching original rows via clean updates
       updateHashStmt.run(redactedMd5, originalMd5);
 
       return {
@@ -156,7 +150,7 @@ export async function runUnredactionPhase(
   db,
   masterKeyBuffer
 ) {
-  const CHUNK_SIZE = 1000;
+  const CHUNK_SIZE = 64 * 1024;
   console.log(
     pc.cyan(pc.bold(`\n🔓 INITIALIZING INLINE UNREDACTION RECONSTRUCTION`))
   );
@@ -177,9 +171,7 @@ export async function runUnredactionPhase(
     }
 
     const records = db
-      .prepare(
-        'SELECT * FROM redactions WHERE redacted_md5 = ? ORDER BY char_position ASC'
-      )
+      .prepare('SELECT * FROM redactions WHERE redacted_md5 = ?')
       .all(inputMd5);
 
     if (records.length === 0) {
@@ -192,7 +184,7 @@ export async function runUnredactionPhase(
     }
 
     const firstRow = records[0];
-    const targetIsEncrypted = firstRow.is_encrypted === 1;
+    const targetIsEncrypted = firstRow && firstRow.is_encrypted === 1;
 
     if (targetIsEncrypted && !masterKeyBuffer) {
       return {
@@ -203,7 +195,6 @@ export async function runUnredactionPhase(
       };
     }
 
-    let currentOffsetTrackingDifference = 0;
     const unredactMap = [];
 
     try {
@@ -212,9 +203,10 @@ export async function runUnredactionPhase(
         if (targetIsEncrypted) {
           word = decryptText(r.redacted_word, masterKeyBuffer);
         }
-        // Positions map directly to where placeholders appear in the redacted file
-        const redactedPosition = r.char_position;
-        unredactMap.push({ redactedPosition, originalWord: word });
+        unredactMap.push({
+          redactedPosition: r.redacted_position,
+          originalWord: word,
+        });
       });
     } catch (err) {
       return {
@@ -224,7 +216,6 @@ export async function runUnredactionPhase(
       };
     }
 
-    // Instantiating standard tracking transformer components
     const transformer = createUnredactionTransformer(unredactMap);
 
     try {
@@ -264,7 +255,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Validate inputs using our helper from lib.js
   validateCliOptions(opts);
 
   const masterKeyBuffer = resolveMasterKey(opts);
@@ -287,7 +277,6 @@ async function main() {
     );
   }
 
-  // Display summary results
   renderFinalAuditReport(operationalSummaryResults);
 }
 

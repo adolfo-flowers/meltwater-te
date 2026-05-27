@@ -4,9 +4,6 @@ import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import { createRedactionTransformer, parseKeywords } from './transformers.js';
 
-/**
- * Synchronous wrapper fulfilling the exact contract required by the test suite.
- */
 export function redactString(keywordsString, text) {
   if (!text) return '';
   if (!keywordsString) return text;
@@ -14,30 +11,24 @@ export function redactString(keywordsString, text) {
   const keywords = parseKeywords(keywordsString);
   if (keywords.length === 0) return text;
 
-  // Domain Rule Fix: Use a word boundary wrapper pattern for whole words
-  // Domain Rule Fix: Add case-insensitivity flags to the underlying transformer
   const transformer = createRedactionTransformer({
     keywords,
-    contextLen: 0, // No context requested by these tests
+    contextLen: 0,
     isWholeWord: true,
     isCaseInsensitive: true,
   });
 
   let outputText = '';
 
-  // Synchronous consumption of the transformer implementation
   transformer.on('data', (chunk) => {
     outputText += chunk.text;
   });
-
-  // Inject text directly into the transformer
   transformer.write(text);
   transformer.end();
 
   return outputText;
 }
 
-// Helper function to process streams cleanly in tests
 const processStream = (transformer, chunks) => {
   return new Promise((resolve, reject) => {
     const results = [];
@@ -118,17 +109,14 @@ describe('Redaction Transformer Tests', () => {
     const transformer = createRedactionTransformer({
       ...config,
     });
-    const chunks = ['12345 ', 'secret']; // Clean Code Fix: Added space after 5 to create a boundary
+    const chunks = ['12345 ', 'secret'];
 
     const results = await processStream(transformer, chunks);
     const allMatches = results.flatMap((r) => r.matches);
 
     strict.equal(allMatches.length, 1);
-    strict.equal(allMatches[0].absoluteOriginalPosition, 6); // Position shifts by 1 because of space
+    strict.equal(allMatches[0].absoluteOriginalPosition, 6);
   });
-});
-
-describe('Document Redactor - Comprehensive Test Suite', () => {
   describe('Basic Functionality', () => {
     test('should redact a single keyword', () => {
       const keywords = 'beer';
@@ -187,29 +175,14 @@ describe('Document Redactor - Comprehensive Test Suite', () => {
       const expected = 'This is top secret.';
       assert.strictEqual(redactString(keywords, text), expected);
     });
-  });
 
-  describe('Architecture Verification (Index & Collision Tracking)', () => {
-    /**
-     * Test Rule: Reverse Index Reconstruction (ORDER BY start_idx DESC)
-     * If the algorithm mutates from left-to-right, replacing 'a' with 'XXXX' shifts
-     * all following character indexes out of alignment. Replacing from right-to-left
-     * ensures upcoming index coordinates remain valid.
-     */
     test('Reverse Index Reconstruction: should not drift indexes when earlier string mutations alter total length', () => {
-      // 'a' expands the string (+3 chars). 'longerphrase' shrinks it (-8 chars).
       const keywords = `a, "longerphrase"`;
       const text = 'a small sample of a longerphrase is here.';
       const expected = 'XXXX small sample of XXXX XXXX is here.';
       assert.strictEqual(redactString(keywords, text), expected);
     });
 
-    /**
-     * Test Rule: Overlapping Security Protection (Nested Collisions)
-     * When a keyword ('Cheese') is fully wrapped inside a phrase ('Cheese Pizza'),
-     * chronological filtering must drop the redundant inner token match to prevent
-     * breaking index arrays or causing double-redaction ('XXXX XXXX' or 'XXXX Pizza').
-     */
     test('Overlapping Security Protection: should drop nested matches to avoid double-redaction corruption', () => {
       const keywords = `"Cheese Pizza", Cheese`;
       const text = 'I love Cheese Pizza.';
@@ -217,11 +190,6 @@ describe('Document Redactor - Comprehensive Test Suite', () => {
       assert.strictEqual(redactString(keywords, text), expected);
     });
 
-    /**
-     * Test Rule: Overlapping Security Protection (Partial Collisions)
-     * If two target zones partially intersect, the first validated match wins,
-     * and the intersecting portions of the subsequent match must be neutralized.
-     */
     test('Overlapping Security Protection: should handle partially intersecting index ranges safely', () => {
       const keywords = `"secret document", "document protocol"`;
       const text = 'This is a secret document protocol.';

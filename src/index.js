@@ -4,16 +4,12 @@ import { pipeline } from 'stream/promises';
 import path from 'path';
 import { program } from 'commander';
 import pc from 'picocolors';
-
-// Import helpers from lib.js
 import {
   initDatabase,
   validateCliOptions,
   resolveMasterKey,
   renderFinalAuditReport,
 } from './lib.js';
-
-// Import streaming operations from transformers.js
 import {
   parseKeywords,
   calculateFileMd5,
@@ -57,7 +53,7 @@ program
 export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
   const contextLen = parseInt(opts.context, 10);
   const keywords = parseKeywords(opts.keywords);
-  const CHUNK_SIZE = 64 * 1024; // 64KB chunks match hardware caches perfectly
+  const CHUNK_SIZE = 64 * 1024;
 
   const insertStmt = db.prepare(`
     INSERT INTO redactions (document_name, original_md5, redacted_word, char_position, redacted_position, context_before, context_after, is_encrypted)
@@ -91,7 +87,6 @@ export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
       };
     }
 
-    // Set up our streaming components
     const redactionTransformer = createRedactionTransformer({
       keywords,
       contextLen,
@@ -105,7 +100,7 @@ export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
       originalMd5,
       encryptEnabled: !!opts.encrypt,
       masterKeyBuffer,
-      batchSize: 100000, // Flushes database inside transaction loops every 100,000 matches
+      batchSize: 100000,
     });
 
     try {
@@ -115,7 +110,6 @@ export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
         CHUNK_SIZE
       );
 
-      // Execute stream processing pipeline natively
       await pipeline(
         ...steps,
         batchWriterTransformer,
@@ -141,9 +135,6 @@ export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
   return Promise.all(pipelinePromises);
 }
 
-/**
- * Handles processing steps for the Unredaction phase.
- */
 export async function runUnredactionPhase(
   filepaths,
   opts,
@@ -240,9 +231,6 @@ export async function runUnredactionPhase(
   return Promise.all(pipelinePromises);
 }
 
-/**
- * Main application entry point orchestrator function.
- */
 async function main() {
   program.parse(process.argv);
   const filepaths = program.args;

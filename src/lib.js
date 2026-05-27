@@ -3,20 +3,11 @@ import { randomBytes } from 'crypto';
 import Database from 'better-sqlite3';
 import pc from 'picocolors';
 
-/**
- * Initializes the SQLite database structure and indexing layers.
- */
 export function initDatabase() {
   const db = new Database('redactions.db');
   db.pragma('journal_mode = WAL');
-  // 2. NITRO BOOST FIXES:
-  // Tell SQLite to rely on the OS memory cache. This reduces physical disk flushes down to a safe minimum.
   db.pragma('synchronous = NORMAL');
-
-  // Drastically increases the memory framework buffer pool sizes to hold the indexes in RAM
-  db.pragma('cache_size = -64000'); // Allocates 64MB of pure operational RAM cache
-
-  // Stores intermediate rollback records in memory instead of heavy temporary disk text assets
+  db.pragma('cache_size = -64000');
   db.pragma('temp_store = MEMORY');
   db.prepare(
     `
@@ -44,9 +35,6 @@ export function initDatabase() {
   return db;
 }
 
-/**
- * Validates basic application runtime options.
- */
 export function validateCliOptions(opts) {
   if (opts.redact && opts.unredact) {
     console.error(
@@ -78,9 +66,6 @@ export function validateCliOptions(opts) {
   }
 }
 
-/**
- * Verifies or automatically generates the master key file based on input options.
- */
 export function resolveMasterKey(opts) {
   if (!opts.encrypt && !opts.unredact) {
     return null;
@@ -132,9 +117,6 @@ export function resolveMasterKey(opts) {
   }
 }
 
-/**
- * Loops over and logs a standard performance and status update back to the CLI user terminal.
- */
 export function renderFinalAuditReport(results) {
   console.log(
     `\n` +

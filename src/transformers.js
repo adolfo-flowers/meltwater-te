@@ -154,7 +154,7 @@ export function createRedactionTransformer({
         break;
       }
 
-      const matchedWord = match[0]; // Fix match object extraction
+      const matchedWord = match[0];
       const precedingFragment = currentSegment.substring(lastIndex, matchIndex);
       cleanedText += precedingFragment;
 
@@ -210,14 +210,12 @@ export function createRedactionTransformer({
         carryOverTail = staticFragment;
       }
 
-      // Safe Backpressure Guard
       const canContinue = this.push({
         text: finalCleanedText,
         matches: matchesFound,
       });
 
       if (!canContinue) {
-        // High-water mark reached: wait for drain before fetching more data
         this.once('drain', callback);
       } else {
         callback();
@@ -248,11 +246,6 @@ export function createRedactionTransformer({
   });
 }
 
-/**
- * 2. TRANSACTIONAL DATABASE BATCH WRITER
- * Flushes row packets directly inside a safe, high-speed transaction block.
- * Memory layout is capped to preserve memory headroom.
- */
 export function createDatabaseBatchWriterTransformer({
   db,
   insertStmt,
@@ -260,11 +253,10 @@ export function createDatabaseBatchWriterTransformer({
   originalMd5,
   encryptEnabled,
   masterKeyBuffer,
-  batchSize = 100000, // Safe memory barrier limit
+  batchSize = 100000,
 }) {
   let recordBatch = [];
 
-  // Create a fast, synchronous transaction runner right inside the transformer setup
   const runTransaction = db.transaction((rows) => {
     for (const row of rows) {
       insertStmt.run(row);
@@ -302,7 +294,7 @@ export function createDatabaseBatchWriterTransformer({
       });
     }
 
-    recordBatch = []; // Free array references early to enable garbage collection execution passes
+    recordBatch = [];
     runTransaction(databaseRows);
   };
 
@@ -317,7 +309,7 @@ export function createDatabaseBatchWriterTransformer({
           flushBatch();
         }
       }
-      this.push(chunk); // Pass object cleanly to next filter
+      this.push(chunk);
       callback();
     },
 
@@ -328,9 +320,6 @@ export function createDatabaseBatchWriterTransformer({
   });
 }
 
-/**
- * 3. TEXT OUTPUT EXTRACTION FILTER
- */
 export function createTextExtractionTransformer() {
   return new Transform({
     writableObjectMode: true,
@@ -345,9 +334,6 @@ export function createTextExtractionTransformer() {
   });
 }
 
-/**
- * 4. UNREDACTION TRANSFORMER
- */
 export function createUnredactionTransformer(unredactMap) {
   let mapTrackers = [...unredactMap].sort(
     (a, b) => a.redactedPosition - b.redactedPosition

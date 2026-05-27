@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
 import path from 'path';
@@ -52,7 +53,7 @@ program
 /**
  * Handles processing steps for the Redaction phase.
  */
-async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
+export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
   const contextLen = parseInt(opts.context, 10);
   const keywords = parseKeywords(opts.keywords);
   const CHUNK_SIZE = 1000;
@@ -149,7 +150,12 @@ async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
 /**
  * Handles processing steps for the Unredaction phase.
  */
-async function runUnredactionPhase(filepaths, opts, db, masterKeyBuffer) {
+export async function runUnredactionPhase(
+  filepaths,
+  opts,
+  db,
+  masterKeyBuffer
+) {
   const CHUNK_SIZE = 1000;
   console.log(
     pc.cyan(pc.bold(`\n🔓 INITIALIZING INLINE UNREDACTION RECONSTRUCTION`))
@@ -285,7 +291,10 @@ async function main() {
   renderFinalAuditReport(operationalSummaryResults);
 }
 
-main().catch((err) => {
-  console.error(pc.red(`Fatal Execution Panic Error: ${err.message}`));
-  process.exit(1);
-});
+const isMain = process.argv[1] === fileURLToPath(import.meta.url);
+if (isMain) {
+  main().catch((err) => {
+    console.error(pc.red(`Fatal Execution Panic Error: ${err.message}`));
+    process.exit(1);
+  });
+}

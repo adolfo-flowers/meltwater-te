@@ -110,16 +110,21 @@ export async function preparePipelineStreams(
   };
 }
 
-/**
- * 1. PURE REDACTION TRANSFORMER
- * Pure chunk processor. Emits structured data chunks downstream.
- */
-export function createRedactionTransformer({ keywords, contextLen }) {
+export function createRedactionTransformer({
+  keywords,
+  contextLen,
+  isWholeWord = true,
+  isCaseInsensitive = false,
+}) {
   const sortedKeywords = [...keywords].sort((a, b) => b.length - a.length);
   const escapedKeywords = sortedKeywords.map((k) =>
     k.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')
   );
-  const masterRegex = new RegExp(`(${escapedKeywords.join('|')})`, 'gi');
+  const patternStr = isWholeWord
+    ? `\\b(${escapedKeywords.join('|')})\\b`
+    : `(${escapedKeywords.join('|')})`;
+  const flags = isCaseInsensitive ? 'gi' : 'g';
+  const masterRegex = new RegExp(patternStr, flags);
 
   const maxKeywordLen = Math.max(...sortedKeywords.map((k) => k.length), 0);
   const tailOverlapSize = maxKeywordLen + contextLen;
@@ -128,78 +133,115 @@ export function createRedactionTransformer({ keywords, contextLen }) {
   let originalCharOffset = 0;
   let redactedCharOffset = 0;
 
+  function processSegment(currentSegment, isFinalFlush = false) {
+    let match;
+    let lastIndex = 0;
+    let cleanedText = '';
+    const matchesFound = [];
+
+    masterRegex.lastIndex = 0;
+    const safeScanBoundary = isFinalFlush
+      ? currentSegment.length
+      : currentSegment.length - tailOverlapSize;
+
+    while ((match = masterRegex.exec(currentSegment)) !== null) {
+      const matchIndex = match.index;
+      if (
+        !isFinalFlush &&
+        matchIndex > safeScanBoundary &&
+        safeScanBoundary > 0
+      ) {
+        break;
+      }
+
+      const matchedWord = match[0]; // Fix match object extraction
+      const precedingFragment = currentSegment.substring(lastIndex, matchIndex);
+      cleanedText += precedingFragment;
+
+      const absoluteOriginalPosition =
+        originalCharOffset + precedingFragment.length;
+      const absoluteRedactedPosition = redactedCharOffset + cleanedText.length;
+
+      matchesFound.push({
+        matchedWord,
+        absoluteOriginalPosition,
+        absoluteRedactedPosition,
+        contextBefore: currentSegment.substring(
+          Math.max(0, matchIndex - contextLen),
+          matchIndex
+        ),
+        contextAfter: currentSegment.substring(
+          matchIndex + matchedWord.length,
+          matchIndex + matchedWord.length + contextLen
+        ),
+      });
+
+      cleanedText += 'XXXX';
+      originalCharOffset += precedingFragment.length + matchedWord.length;
+      lastIndex = masterRegex.lastIndex;
+    }
+
+    const staticFragment = currentSegment.substring(lastIndex);
+    return { cleanedText, matchesFound, staticFragment };
+  }
+
   return new Transform({
     writableObjectMode: false,
-    readableObjectMode: true, // Emits objects containing text & found matches
+    readableObjectMode: true,
 
     transform(chunk, encoding, callback) {
       const currentSegment = carryOverTail + chunk.toString();
-      let match;
-      let lastIndex = 0;
-      let cleanedText = '';
-      const matchesFound = [];
+      const { cleanedText, matchesFound, staticFragment } = processSegment(
+        currentSegment,
+        false
+      );
+      let finalCleanedText = cleanedText;
 
-      masterRegex.lastIndex = 0;
-      const safeScanBoundary = currentSegment.length - tailOverlapSize;
-
-      while ((match = masterRegex.exec(currentSegment)) !== null) {
-        const matchIndex = match.index;
-        if (matchIndex > safeScanBoundary && safeScanBoundary > 0) {
-          break;
-        }
-
-        const matchedWord = match[0];
-        const precedingFragment = currentSegment.substring(
-          lastIndex,
-          matchIndex
-        );
-        cleanedText += precedingFragment;
-
-        const absoluteOriginalPosition =
-          originalCharOffset + precedingFragment.length;
-        const absoluteRedactedPosition =
-          redactedCharOffset + cleanedText.length;
-
-        matchesFound.push({
-          matchedWord,
-          absoluteOriginalPosition,
-          absoluteRedactedPosition,
-          contextBefore: currentSegment.substring(
-            Math.max(0, matchIndex - contextLen),
-            matchIndex
-          ),
-          contextAfter: currentSegment.substring(
-            matchIndex + matchedWord.length,
-            matchIndex + matchedWord.length + contextLen
-          ),
-        });
-
-        cleanedText += 'XXXX';
-        originalCharOffset += precedingFragment.length + matchedWord.length;
-        lastIndex = masterRegex.lastIndex;
-      }
-
-      const staticFragment = currentSegment.substring(lastIndex);
       if (staticFragment.length > tailOverlapSize) {
         const safePushLen = staticFragment.length - tailOverlapSize;
         const pushText = staticFragment.substring(0, safePushLen);
-        cleanedText += pushText;
+        finalCleanedText += pushText;
 
-        this.push({ text: cleanedText, matches: matchesFound });
         originalCharOffset += pushText.length;
-        redactedCharOffset += cleanedText.length;
+        redactedCharOffset += finalCleanedText.length;
         carryOverTail = staticFragment.substring(safePushLen);
       } else {
-        this.push({ text: cleanedText, matches: matchesFound });
-        redactedCharOffset += cleanedText.length;
+        redactedCharOffset += finalCleanedText.length;
         carryOverTail = staticFragment;
       }
-      callback();
+
+      // Safe Backpressure Guard
+      const canContinue = this.push({
+        text: finalCleanedText,
+        matches: matchesFound,
+      });
+
+      if (!canContinue) {
+        // High-water mark reached: wait for drain before fetching more data
+        this.once('drain', callback);
+      } else {
+        callback();
+      }
     },
 
     flush(callback) {
       if (carryOverTail) {
-        this.push({ text: carryOverTail, matches: [] });
+        const { cleanedText, matchesFound, staticFragment } = processSegment(
+          carryOverTail,
+          true
+        );
+        const finalCleanedText = cleanedText + staticFragment;
+
+        if (finalCleanedText.length > 0 || matchesFound.length > 0) {
+          const canContinue = this.push({
+            text: finalCleanedText,
+            matches: matchesFound,
+          });
+          if (!canContinue) {
+            this.once('drain', callback);
+            return;
+          }
+        }
       }
       callback();
     },

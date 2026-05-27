@@ -2,15 +2,23 @@ import { fileURLToPath } from 'node:url';
 import { createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
 import path from 'path';
+import {
+  Worker,
+  isMainThread,
+  workerData,
+  parentPort,
+} from 'node:worker_threads';
 import { program } from 'commander';
 import pc from 'picocolors';
 import {
   initDatabase,
+  createWorkerDatabaseConnection,
   validateCliOptions,
   resolveMasterKey,
   renderFinalAuditReport,
 } from './lib.js';
 import {
+  decryptText,
   parseKeywords,
   calculateFileMd5,
   preparePipelineStreams,
@@ -20,55 +28,143 @@ import {
   createUnredactionTransformer,
 } from './transformers.js';
 
-program
-  .name('declassify-master-tool')
-  .description(
-    'Concurrently redacts or unredacts files using an indexed SQLite database and a central Master Key file.'
-  )
-  .argument('<filepaths...>', 'paths to the target text files')
-  .option('-r, --redact', 'Execute text masking / redaction phase')
-  .option('-u, --unredact', 'Execute document restoration / unredaction phase')
-  .option(
-    '-k, --keywords <string>',
-    'comma/space split keywords (required for redaction). Wrap phrases in quotes.'
-  )
-  .option(
-    '-c, --context <number>',
-    'number of characters of padding around the redaction context tracking',
-    '20'
-  )
-  .option(
-    '--encrypt',
-    'Enable AES-256-GCM encryption for stored metadata parameters'
-  )
-  .option('--keyfile <path>', 'Path to the central master encryption key file')
-  .option(
-    '--generate-key',
-    'Automatically generate the master key file if it does not exist'
-  );
+const __filename = fileURLToPath(import.meta.url);
 
-/**
- * Handles processing steps for the Redaction phase.
- */
-export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
-  const contextLen = parseInt(opts.context, 10);
-  const keywords = parseKeywords(opts.keywords);
+if (isMainThread) {
+  program
+    .name('declassify-master-tool')
+    .description(
+      'Concurrently redacts or unredacts files using isolated worker threads, each utilizing individual database connections.'
+    )
+    .argument('<filepaths...>', 'paths to the target text files')
+    .option('-r, --redact', 'Execute text masking / redaction phase')
+    .option(
+      '-u, --unredact',
+      'Execute document restoration / unredaction phase'
+    )
+    .option(
+      '-k, --keywords <string>',
+      'comma/space split keywords (required for redaction). Wrap phrases in quotes.'
+    )
+    .option(
+      '-c, --context <number>',
+      'number of characters of padding around the redaction context tracking',
+      '20'
+    )
+    .option(
+      '--encrypt',
+      'Enable AES-256-GCM encryption for stored metadata parameters'
+    )
+    .option(
+      '--keyfile <path>',
+      'Path to the central master encryption key file'
+    )
+    .option(
+      '--generate-key',
+      'Automatically generate the master key file if it does not exist'
+    );
+
+  /**
+   * Spawns a dedicated worker thread to process a target file.
+   */
+  function runWorker(workerOptions) {
+    return new Promise((resolve) => {
+      const worker = new Worker(__filename, { workerData: workerOptions });
+
+      worker.on('error', (err) => {
+        resolve({
+          filepath: workerOptions.filepath,
+          error: `Worker Crash: ${err.message}`,
+          success: false,
+        });
+      });
+
+      worker.on('exit', (code) => {
+        if (code !== 0) {
+          resolve({
+            filepath: workerOptions.filepath,
+            error: `Worker exited with status code ${code}`,
+            success: false,
+          });
+        }
+      });
+
+      worker.on('message', (msg) => {
+        if (msg.type === 'RESULT') {
+          resolve(msg.data);
+        }
+      });
+    });
+  }
+
+  async function main() {
+    program.parse(process.argv);
+    const filepaths = program.args;
+    const opts = program.opts();
+
+    if (filepaths.length === 0) {
+      console.error(
+        pc.red('Error: Please provide at least one target file path.')
+      );
+      process.exit(1);
+    }
+
+    validateCliOptions(opts);
+
+    // Master ensures schema and WAL are initialized once before workers boot up
+    const masterKeyBuffer = resolveMasterKey(opts);
+    const masterDb = initDatabase();
+    masterDb.close(); // Close to avoid holding an extra connection handle unnecessarily
+
+    let operationalSummaryResults = [];
+
+    if (opts.redact) {
+      console.log(
+        pc.red(pc.bold(`\n🔒 INITIALIZING MULTI-THREADED DB REDACTION PROCESS`))
+      );
+
+      const workerPromises = filepaths.map((filepath) =>
+        runWorker({
+          mode: 'REDACT',
+          filepath,
+          opts,
+          masterKeyBuffer,
+        })
+      );
+      operationalSummaryResults = await Promise.all(workerPromises);
+    } else if (opts.unredact) {
+      console.log(
+        pc.cyan(
+          pc.bold(
+            `\n🔓 INITIALIZING MULTI-THREADED DB UNREDACTION RECONSTRUCTION`
+          )
+        )
+      );
+
+      const workerPromises = filepaths.map((filepath) =>
+        runWorker({
+          mode: 'UNREDACT',
+          filepath,
+          masterKeyBuffer,
+        })
+      );
+      operationalSummaryResults = await Promise.all(workerPromises);
+    }
+
+    renderFinalAuditReport(operationalSummaryResults);
+  }
+
+  main().catch((err) => {
+    console.error(pc.red(`Fatal Execution Panic Error: ${err.message}`));
+    process.exit(1);
+  });
+} else {
+  // ==========================================
+  // WORKER THREAD ISOLATED EXECUTION BOUNDARY
+  // ==========================================
   const CHUNK_SIZE = 64 * 1024;
 
-  const insertStmt = db.prepare(`
-    INSERT INTO redactions (document_name, original_md5, redacted_word, char_position, redacted_position, context_before, context_after, is_encrypted)
-    VALUES (@documentName, @originalMd5, @redactedWord, @charPosition, @redactedPosition, @contextBefore, @contextAfter, @isEncrypted)
-  `);
-
-  const updateHashStmt = db.prepare(`
-    UPDATE redactions SET redacted_md5 = ? WHERE original_md5 = ? AND redacted_md5 IS NULL
-  `);
-
-  console.log(
-    pc.red(pc.bold(`\n🔒 INITIALIZING INLINE PIPELINE REDACTION PROCESS`))
-  );
-
-  const pipelinePromises = filepaths.map(async (filepath) => {
+  async function executeRedactionWorker({ filepath, opts, masterKeyBuffer }) {
     const filename = path.basename(filepath);
     const parsedPath = path.parse(filepath);
     const outputPath = path.join(
@@ -87,6 +183,21 @@ export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
       };
     }
 
+    // Initialize individual concurrent worker connection instance
+    const db = createWorkerDatabaseConnection();
+
+    const insertStmt = db.prepare(`
+      INSERT INTO redactions (document_name, original_md5, redacted_word, char_position, redacted_position, context_before, context_after, is_encrypted)
+      VALUES (@documentName, @originalMd5, @redactedWord, @charPosition, @redactedPosition, @contextBefore, @contextAfter, @isEncrypted)
+    `);
+
+    const updateHashStmt = db.prepare(`
+      UPDATE redactions SET redacted_md5 = ? WHERE original_md5 = ? AND redacted_md5 IS NULL
+    `);
+
+    const keywords = parseKeywords(opts.keywords);
+    const contextLen = parseInt(opts.context, 10);
+
     const redactionTransformer = createRedactionTransformer({
       keywords,
       contextLen,
@@ -100,7 +211,7 @@ export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
       originalMd5,
       encryptEnabled: !!opts.encrypt,
       masterKeyBuffer,
-      batchSize: 100000,
+      batchSize: 1000, // Safe batch size utilizing your standard transformer configurations
     });
 
     try {
@@ -129,24 +240,12 @@ export async function runRedactionPhase(filepaths, opts, db, masterKeyBuffer) {
       };
     } catch (err) {
       return { filepath, error: err.message, success: false };
+    } finally {
+      db.close(); // Clean up thread resources
     }
-  });
+  }
 
-  return Promise.all(pipelinePromises);
-}
-
-export async function runUnredactionPhase(
-  filepaths,
-  opts,
-  db,
-  masterKeyBuffer
-) {
-  const CHUNK_SIZE = 64 * 1024;
-  console.log(
-    pc.cyan(pc.bold(`\n🔓 INITIALIZING INLINE UNREDACTION RECONSTRUCTION`))
-  );
-
-  const pipelinePromises = filepaths.map(async (filepath) => {
+  async function executeUnredactionWorker({ filepath, masterKeyBuffer }) {
     const parsedPath = path.parse(filepath);
     const cleanName = parsedPath.name.replace('.REDACTED', '');
     const outputPath = path.join(
@@ -161,34 +260,36 @@ export async function runUnredactionPhase(
       return { filepath, error: `Read error: ${err.message}`, success: false };
     }
 
-    const records = db
-      .prepare('SELECT * FROM redactions WHERE redacted_md5 = ?')
-      .all(inputMd5);
-
-    if (records.length === 0) {
-      return {
-        filepath,
-        error:
-          'Document signature could not be found in tracking database registry.',
-        success: false,
-      };
-    }
-
-    const firstRow = records[0];
-    const targetIsEncrypted = firstRow && firstRow.is_encrypted === 1;
-
-    if (targetIsEncrypted && !masterKeyBuffer) {
-      return {
-        filepath,
-        error:
-          'This database context is encrypted. Please specify the valid path using the --keyfile parameter.',
-        success: false,
-      };
-    }
-
-    const unredactMap = [];
+    // Initialize individual concurrent worker connection instance
+    const db = createWorkerDatabaseConnection();
 
     try {
+      const records = db
+        .prepare('SELECT * FROM redactions WHERE redacted_md5 = ?')
+        .all(inputMd5);
+
+      if (records.length === 0) {
+        return {
+          filepath,
+          error:
+            'Document signature could not be found in tracking database registry.',
+          success: false,
+        };
+      }
+
+      const firstRow = records[0];
+      const targetIsEncrypted = firstRow && firstRow.is_encrypted === 1;
+
+      if (targetIsEncrypted && !masterKeyBuffer) {
+        return {
+          filepath,
+          error:
+            'This database context is encrypted. Please specify the valid path using the --keyfile parameter.',
+          success: false,
+        };
+      }
+
+      const unredactMap = [];
       records.forEach((r) => {
         let word = r.redacted_word;
         if (targetIsEncrypted) {
@@ -199,22 +300,14 @@ export async function runUnredactionPhase(
           originalWord: word,
         });
       });
-    } catch (err) {
-      return {
-        filepath,
-        error: `Decryption execution failure. Verify master key file contents: ${err.message}`,
-        success: false,
-      };
-    }
 
-    const transformer = createUnredactionTransformer(unredactMap);
-
-    try {
+      const transformer = createUnredactionTransformer(unredactMap);
       const { encoding, steps } = await preparePipelineStreams(
         filepath,
         transformer,
         CHUNK_SIZE
       );
+
       await pipeline(...steps, createWriteStream(outputPath));
       return {
         filepath,
@@ -225,53 +318,19 @@ export async function runUnredactionPhase(
       };
     } catch (err) {
       return { filepath, error: err.message, success: false };
+    } finally {
+      db.close(); // Clean up thread resources
     }
-  });
-
-  return Promise.all(pipelinePromises);
-}
-
-async function main() {
-  program.parse(process.argv);
-  const filepaths = program.args;
-  const opts = program.opts();
-
-  if (filepaths.length === 0) {
-    console.error(
-      pc.red('Error: Please provide at least one target file path.')
-    );
-    process.exit(1);
   }
 
-  validateCliOptions(opts);
-
-  const masterKeyBuffer = resolveMasterKey(opts);
-  const db = initDatabase();
-  let operationalSummaryResults = [];
-
-  if (opts.redact) {
-    operationalSummaryResults = await runRedactionPhase(
-      filepaths,
-      opts,
-      db,
-      masterKeyBuffer
-    );
-  } else if (opts.unredact) {
-    operationalSummaryResults = await runUnredactionPhase(
-      filepaths,
-      opts,
-      db,
-      masterKeyBuffer
-    );
-  }
-
-  renderFinalAuditReport(operationalSummaryResults);
-}
-
-const isMain = process.argv[1] === fileURLToPath(import.meta.url);
-if (isMain) {
-  main().catch((err) => {
-    console.error(pc.red(`Fatal Execution Panic Error: ${err.message}`));
-    process.exit(1);
-  });
+  (async () => {
+    let result;
+    if (workerData.mode === 'REDACT') {
+      result = await executeRedactionWorker(workerData);
+    } else if (workerData.mode === 'UNREDACT') {
+      result = await executeUnredactionWorker(workerData);
+    }
+    parentPort.postMessage({ type: 'RESULT', data: result });
+    process.exit(0);
+  })();
 }

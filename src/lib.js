@@ -3,12 +3,19 @@ import { randomBytes } from 'crypto';
 import Database from 'better-sqlite3';
 import pc from 'picocolors';
 
-export function initDatabase() {
-  const db = new Database('redactions.db');
+/**
+ * Common configuration settings applied uniformly to all database instances.
+ */
+function applyPragmasAndIndexes(db) {
+  // WAL mode allows multiple readers and a writer to interact concurrently
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('cache_size = -64000');
   db.pragma('temp_store = MEMORY');
+
+  // Set a busy timeout so threads back off gracefully and retry instead of crashing instantly
+  db.pragma('busy_timeout = 5000');
+
   db.prepare(
     `
     CREATE TABLE IF NOT EXISTS redactions (
@@ -32,7 +39,26 @@ export function initDatabase() {
   db.prepare(
     `CREATE INDEX IF NOT EXISTS idx_redactions_redacted_md5 ON redactions (redacted_md5)`
   ).run();
+
   return db;
+}
+
+/**
+ * Initializes the primary master instance database connector.
+ */
+export function initDatabase() {
+  const db = new Database('redactions.db');
+  return applyPragmasAndIndexes(db);
+}
+
+/**
+ * Creates an isolated SQLite connection descriptor tailored for unique worker threads.
+ * better-sqlite3 handles are pinned to individual thread execution boundaries.
+ */
+export function createWorkerDatabaseConnection() {
+  // Open a completely independent pointer instance targeting the same storage subsystem file
+  const db = new Database('redactions.db', { readonly: false });
+  return applyPragmasAndIndexes(db);
 }
 
 export function validateCliOptions(opts) {

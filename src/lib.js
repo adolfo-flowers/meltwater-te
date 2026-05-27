@@ -9,6 +9,15 @@ import pc from 'picocolors';
 export function initDatabase() {
   const db = new Database('redactions.db');
   db.pragma('journal_mode = WAL');
+  // 2. NITRO BOOST FIXES:
+  // Tell SQLite to rely on the OS memory cache. This reduces physical disk flushes down to a safe minimum.
+  db.pragma('synchronous = NORMAL');
+
+  // Drastically increases the memory framework buffer pool sizes to hold the indexes in RAM
+  db.pragma('cache_size = -64000'); // Allocates 64MB of pure operational RAM cache
+
+  // Stores intermediate rollback records in memory instead of heavy temporary disk text assets
+  db.pragma('temp_store = MEMORY');
   db.prepare(
     `
     CREATE TABLE IF NOT EXISTS redactions (
@@ -18,6 +27,7 @@ export function initDatabase() {
       redacted_md5 TEXT,
       redacted_word TEXT,
       char_position INTEGER,
+      redacted_position INTEGER,
       context_before TEXT,
       context_after TEXT,
       is_encrypted INTEGER DEFAULT 0
